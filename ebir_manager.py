@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QGroupBox, QAbstractItemView, QGridLayout, QCheckBox
 )
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QKeySequence, QShortcut
 
 BACKUP_DIR_NAME = "_ebir_migrator_backups"
 
@@ -71,7 +71,6 @@ def parse_xml_record(file_path):
         for raw_key, raw_val in extract_ebir_key_values(xml_data):
             if not raw_val:
                 continue
-            # Decode both URL percent-encoding (%20, %2C) and HTML entities (&amp;)
             val = html.unescape(unquote(raw_val)).strip()
             if not val:
                 continue
@@ -119,7 +118,6 @@ def parse_xml_record(file_path):
                 full_indiv = f"{last_name}, {first_name} {middle_name}".strip()
                 name = re.sub(r'\s+', ' ', full_indiv).strip(", ")
             elif first_name:
-                # In eBIRForms profile XMLs, 'fn' holds the full company/taxpayer name
                 name = re.sub(r'\s+', ' ', first_name).strip()
             elif last_name:
                 name = re.sub(r'\s+', ' ', last_name).strip()
@@ -133,8 +131,8 @@ def parse_xml_record(file_path):
         elif tin_full:
             canonical_tin = tin_full
         else:
-            match = re.search(r'(\d{9,14})', filename)
-            canonical_tin = match.group(1) if match else "Unknown-TIN"
+            tin_matches = re.findall(r'\d{9,14}', filename)
+            canonical_tin = tin_matches[0] if tin_matches else "Unknown-TIN"
         
         clean_tin = re.sub(r'[^0-9]', '', canonical_tin)[:9]
 
@@ -150,13 +148,35 @@ def parse_xml_record(file_path):
     except Exception:
         return None
 
+def is_malformed_clone_filename(filename):
+    """Detects files accidentally named MMDDYYYY-TIN-FORM-Period.xml by older versions."""
+    return bool(re.match(r'^\d{8}-\d{9,14}-.+-\d{4,8}(Q[1-4])?\.xml$', filename, re.IGNORECASE))
+
+def is_savefile_record(file_info):
+    """Returns True if the file is a valid template in 'savefile' (not profile, IAF_RDO_Copy, or a malformed clone)."""
+    rel = file_info.get('rel_dir', '').lower()
+    if 'profile' in rel or 'iaf_rdo' in rel or 'backup' in rel:
+        return False
+    if is_malformed_clone_filename(file_info.get('filename', '')):
+        return False
+    return True
+
 def extract_form_type(filename, rel_dir=""):
-    if 'profile' in rel_dir.lower():
+    """Extracts the BIR Form code (e.g., 1601C, 1601Cv2018, 0619E, 2550Q) from savefile XMLs."""
+    rel = rel_dir.lower()
+    if 'profile' in rel or 'iaf_rdo' in rel:
         return None
     name, _ = os.path.splitext(filename)
+    name = re.sub(r'^\d{8}-(?=\d{9,14}-)', '', name)
     parts = re.split(r'[-_]', name)
+
+    if len(parts) >= 3 and re.match(r'^\d{9,14}$', parts[0]):
+        return parts[1].upper()
+
     for part in parts:
-        if re.match(r'^\d{8,14}$', part):
+        if re.match(r'^\d{6,14}$', part):
+            continue
+        if re.match(r'^(\d{4,6}Q[1-4]|Q[1-4]\d{4})$', part, re.IGNORECASE):
             continue
         if len(part) >= 3 and any(c.isdigit() for c in part):
             return part.upper()
@@ -224,15 +244,28 @@ def apply_date_transform_to_string(xml_data, new_month, new_year):
     last_day = calendar.monthrange(new_year, new_month)[1]
     mm = f"{new_month:02d}"
     yyyy = str(new_year)
-    mm_dd_yyyy = f"{mm}/{last_day}/{yyyy}"
+    mm_dd_yyyy = f"{mm}/{last_day:02d}/{yyyy}"
 
-    # 1. Update <div>key=valuekey=</div> date fields (e.g., frm1601C:txtMonth=10)
+    # 1. Catch unnamed JSF Month dropdowns (like frm1601c:j_id201=12) sitting right before the Year field
+    xml_data = re.sub(
+        r'(<div[^>]*>\s*([a-zA-Z0-9_:-]+)=)(\s*(?:0?[1-9]|1[0-2])\s*)(\2=\s*</div>\s*<div[^>]*>\s*[a-zA-Z0-9_:-]*(?:year|yr)[a-zA-Z0-9_:-]*=)',
+        lambda m: f"{m.group(1)}{mm}{m.group(4)}",
+        xml_data, flags=re.IGNORECASE | re.DOTALL
+    )
+
+    # 2. Update <div>key=valuekey=</div> date fields (including j_id201, txtMonth, txtYear, etc.)
     def div_date_replacer(match):
         prefix, raw_key, val, suffix = match.groups()
         short_key = raw_key.split(':')[-1].lower()
-        if re.match(r'^(txt)?(forthe)?month\d*$', short_key):
+        clean_val = val.strip()
+
+        is_month_key = (
+            any(k in short_key for k in ('month', 'mon', 'mnth'))
+            or short_key in ('j_id201', 'txt1', 'item1', 'ddlmonth', 'cbomonth')
+        )
+        if is_month_key and re.match(r'^(0?[1-9]|1[0-2])$', clean_val):
             return f"{prefix}{mm}{suffix}"
-        elif re.match(r'^(txt)?year\d*$', short_key):
+        elif any(k in short_key for k in ('year', 'yr')) and re.match(r'^\d{4}$', clean_val):
             return f"{prefix}{yyyy}{suffix}"
         elif 'returnperiod' in short_key:
             return f"{prefix}{mm_dd_yyyy}{suffix}"
@@ -243,29 +276,54 @@ def apply_date_transform_to_string(xml_data, new_month, new_year):
         div_date_replacer, xml_data, flags=re.IGNORECASE | re.DOTALL
     )
 
-    # 2. Update standard XML date nodes (<ReturnPeriod>, <month>, <year>)
-    xml_data = re.sub(r'(<([a-zA-Z0-9_:-]*month\d*)[^>]*>)([^<]+)(</\2>)', 
+    # 3. Update standard XML date nodes (<ReturnPeriod>, <month>, <year>)
+    xml_data = re.sub(r'(<([a-zA-Z0-9_:-]*month\d*)[^>]*>)(\s*\d{1,2}\s*)(</\2>)', 
                       lambda m: f"{m.group(1)}{mm}{m.group(4)}", xml_data, flags=re.IGNORECASE)
-    xml_data = re.sub(r'(<([a-zA-Z0-9_:-]*year\d*)[^>]*>)([^<]+)(</\2>)', 
+    xml_data = re.sub(r'(<([a-zA-Z0-9_:-]*year\d*)[^>]*>)(\s*\d{4}\s*)(</\2>)', 
                       lambda m: f"{m.group(1)}{yyyy}{m.group(4)}", xml_data, flags=re.IGNORECASE)
     xml_data = re.sub(r'(<([a-zA-Z0-9_:-]*returnperiod)[^>]*>)([^<]+)(</\2>)', 
                       lambda m: f"{m.group(1)}{mm_dd_yyyy}{m.group(4)}", xml_data, flags=re.IGNORECASE)
     return xml_data
 
 def generate_cloned_filename(original_filename, new_month, new_year, mode, custom_suffix):
+    """
+    Strictly maintains eBIRForms' required TIN-Form-Period.xml structure:
+      - 00172635200000-1601C-122018.xml      -> 00172635200000-1601C-112026.xml
+      - 00172635200000-1601Cv2018-122018.xml -> 00172635200000-1601Cv2018-112026.xml
+      - 00172635200000-0605-12312018.xml     -> 00172635200000-0605-11302026.xml
+      - 00172635200000-2550Q-122018Q4.xml    -> 00172635200000-2550Q-112026Q4.xml
+    """
     last_day = calendar.monthrange(new_year, new_month)[1]
     mm = f"{new_month:02d}"
     yyyy = str(new_year)
-    mmddyyyy = f"{mm}{last_day}{yyyy}"
+    mmyyyy = f"{mm}{yyyy}"
+    mmddyyyy = f"{mm}{last_day:02d}{yyyy}"
+    q_num = (new_month - 1) // 3 + 1
 
-    name = transform_filename(original_filename, mode, custom_suffix)
-    if re.match(r'^\d{8}-', name):
-        name = re.sub(r'^\d{8}', mmddyyyy, name)
-    elif re.search(r'-\d{8}\.xml$', name, re.IGNORECASE):
-        name = re.sub(r'-\d{8}(\.xml)$', f'-{mmddyyyy}\\1', name, flags=re.IGNORECASE)
+    cleaned_orig = re.sub(r'^\d{8}-(?=\d{9,14}-)', '', original_filename)
+    name = transform_filename(cleaned_orig, mode, custom_suffix)
+    stem, ext = os.path.splitext(name)
+
+    if re.search(r'-\d{6}Q[1-4]$', stem, re.IGNORECASE):
+        stem = re.sub(r'-\d{6}Q[1-4]$', f'-{mmyyyy}Q{q_num}', stem, flags=re.IGNORECASE)
+    elif re.search(r'-\d{4}Q[1-4]$', stem, re.IGNORECASE):
+        stem = re.sub(r'-\d{4}Q[1-4]$', f'-{yyyy}Q{q_num}', stem, flags=re.IGNORECASE)
+    elif re.search(r'-Q[1-4]\d{4}$', stem, re.IGNORECASE):
+        stem = re.sub(r'-Q[1-4]\d{4}$', f'-Q{q_num}{yyyy}', stem, flags=re.IGNORECASE)
+    elif re.search(r'-\d{6}$', stem):
+        stem = re.sub(r'-\d{6}$', f'-{mmyyyy}', stem)
+    elif re.search(r'-\d{8}$', stem):
+        stem = re.sub(r'-\d{8}$', f'-{mmddyyyy}', stem)
+    elif stem.count('-') >= 2 and re.search(r'-\d{4}$', stem):
+        stem = re.sub(r'-\d{4}$', f'-{yyyy}', stem)
+    elif re.match(r'^\d{8}-', stem):
+        stem = re.sub(r'^\d{8}-', f'{mmddyyyy}-', stem)
+    elif re.match(r'^\d{6}-', stem):
+        stem = re.sub(r'^\d{6}-', f'{mmyyyy}-', stem)
     else:
-        name = f"{mmddyyyy}-{name}"
-    return name
+        stem = f"{stem}-{mmyyyy}"
+
+    return stem + ext
 
 def transform_xml_file(source_path, dest_path, mode, custom_suffix=""):
     with open(source_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -424,7 +482,7 @@ class BatchCloneDialog(QDialog):
     def __init__(self, taxpayer_list, dest_folder, dest_records, tin_mode, custom_suffix, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Batch Clone Returns ({len(taxpayer_list)} Taxpayer(s) Selected)")
-        self.resize(820, 520)
+        self.resize(880, 540)
         self.taxpayer_list = taxpayer_list
         self.dest_folder = dest_folder
         self.dest_records = dest_records
@@ -459,15 +517,21 @@ class BatchCloneDialog(QDialog):
 
         layout.addWidget(top_box)
 
-        layout.addWidget(QLabel("<b>Preview of Returns to Generate (Uncheck any you want to skip):</b>"))
+        layout.addWidget(QLabel(
+            "<b>Preview of Returns to Generate in 'savefile' (Format: TIN-Form-MMYYYY.xml):</b>"
+        ))
         self.preview_table = QTableWidget(0, 5)
         self.preview_table.setHorizontalHeaderLabels([
-            "Clone", "Taxpayer Name", "TIN", "Template File (Latest Match)", "New Return Filename"
+            "Clone", "Taxpayer Name", "TIN", "Template File (from savefile)", "New Return Filename"
         ])
+        self.preview_table.setFocusPolicy(Qt.NoFocus)
+        self.preview_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
+        self.preview_table.setColumnWidth(0, 55)
         self.preview_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.preview_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         self.preview_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
         self.preview_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.preview_table.cellClicked.connect(self.on_preview_cell_clicked)
         layout.addWidget(self.preview_table)
 
         btn_layout = QHBoxLayout()
@@ -479,10 +543,18 @@ class BatchCloneDialog(QDialog):
 
         self.refresh_preview_table()
 
+    def on_preview_cell_clicked(self, row, col):
+        if col == 0:
+            item = self.preview_table.item(row, 0)
+            if item and item.data(Qt.UserRole) is not None:
+                item.setCheckState(Qt.Unchecked if item.checkState() == Qt.Checked else Qt.Checked)
+
     def populate_form_types(self):
         form_types = set()
         for rec in self.taxpayer_list:
             for f in rec['files']:
+                if not is_savefile_record(f):
+                    continue
                 ft = extract_form_type(f['filename'], f.get('rel_dir', ''))
                 if ft:
                     form_types.add(ft)
@@ -494,7 +566,7 @@ class BatchCloneDialog(QDialog):
     def get_matching_template(self, rec, selected_form_type):
         candidates = []
         for f in rec['files']:
-            if 'profile' in f.get('rel_dir', '').lower():
+            if not is_savefile_record(f):
                 continue
             ft = extract_form_type(f['filename'], f.get('rel_dir', ''))
             if selected_form_type == "ANY" or ft == selected_form_type:
@@ -503,13 +575,22 @@ class BatchCloneDialog(QDialog):
             return None
         return max(candidates, key=lambda x: x['mtime'])
 
+    def get_effective_tin_mode(self, rec):
+        if self.tin_mode != "none":
+            return self.tin_mode
+        clean_digits = re.sub(r'[^0-9]', '', rec.get('tin', ''))
+        if len(clean_digits) >= 14:
+            return "append_00"
+        return self.tin_mode
+
     def refresh_preview_table(self):
         self.preview_table.setRowCount(0)
         selected_ft = self.form_type_combo.currentData()
         month = self.month_combo.currentIndex() + 1
         try:
             year = int(self.year_input.text().strip())
-            if year < 1990 or year > 2100: raise ValueError
+            if year < 1990 or year > 2100:
+                raise ValueError
         except ValueError:
             return
 
@@ -519,20 +600,21 @@ class BatchCloneDialog(QDialog):
 
             template_file = self.get_matching_template(rec, selected_ft)
             chk = QTableWidgetItem()
-            chk.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
 
             if template_file:
+                eff_mode = self.get_effective_tin_mode(rec)
                 new_fname = generate_cloned_filename(
-                    template_file['filename'], month, year, self.tin_mode, self.custom_suffix
+                    template_file['filename'], month, year, eff_mode, self.custom_suffix
                 )
+                chk.setFlags(Qt.ItemIsEnabled)
                 chk.setCheckState(Qt.Checked)
-                chk.setData(Qt.UserRole, (rec, template_file, new_fname))
+                chk.setData(Qt.UserRole, (rec, template_file, new_fname, eff_mode))
                 tpl_text = template_file['filename']
             else:
-                chk.setCheckState(Qt.Unchecked)
                 chk.setFlags(Qt.NoItemFlags)
+                chk.setCheckState(Qt.Unchecked)
                 chk.setData(Qt.UserRole, None)
-                tpl_text = f"No {selected_ft} return found"
+                tpl_text = f"No {selected_ft} return in savefile"
                 new_fname = "—"
 
             self.preview_table.setItem(r, 0, chk)
@@ -557,8 +639,8 @@ class BatchCloneDialog(QDialog):
             if not data:
                 continue
 
-            rec, template_file, new_filename = data
-            rel_dir = template_file.get('rel_dir', 'savefile') or 'savefile'
+            rec, template_file, new_filename, eff_mode = data
+            rel_dir = "savefile"
             target_dir = os.path.join(self.dest_folder, rel_dir)
             os.makedirs(target_dir, exist_ok=True)
 
@@ -573,7 +655,7 @@ class BatchCloneDialog(QDialog):
             try:
                 with open(template_file['path'], 'r', encoding='utf-8', errors='ignore') as f:
                     xml_data = f.read()
-                xml_data = apply_tin_transform_to_string(xml_data, self.tin_mode, self.custom_suffix)
+                xml_data = apply_tin_transform_to_string(xml_data, eff_mode, self.custom_suffix)
                 xml_data = apply_date_transform_to_string(xml_data, month, year)
                 with open(dest_path, 'w', encoding='utf-8') as f:
                     f.write(xml_data)
@@ -581,7 +663,10 @@ class BatchCloneDialog(QDialog):
             except Exception as e:
                 QMessageBox.warning(self, "Clone Error", f"Failed on {rec['name']}: {e}")
 
-        QMessageBox.information(self, "Batch Clone Complete", f"Successfully generated {cloned_count} cloned return(s)!")
+        QMessageBox.information(
+            self, "Batch Clone Complete",
+            f"Successfully generated {cloned_count} cloned return(s) inside the 'savefile' folder!"
+        )
         self.accept()
 
 
@@ -614,15 +699,19 @@ class RevertDialog(QDialog):
         self.table.setHorizontalHeaderLabels([
             "Revert", "Taxpayer Name", "TIN", "Backup Date", "Last Operation"
         ])
+        self.table.setFocusPolicy(Qt.NoFocus)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
+        self.table.setColumnWidth(0, 55)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.cellClicked.connect(self.on_revert_cell_clicked)
         layout.addWidget(self.table)
 
         for base_tin, meta in backups_dict.items():
             r = self.table.rowCount()
             self.table.insertRow(r)
             chk = QTableWidgetItem()
-            chk.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+            chk.setFlags(Qt.ItemIsEnabled)
             chk.setCheckState(Qt.Checked)
             chk.setData(Qt.UserRole, base_tin)
             self.table.setItem(r, 0, chk)
@@ -635,6 +724,11 @@ class RevertDialog(QDialog):
         restore_btn.setStyleSheet("background-color: #C62828; color: white; font-weight: bold; padding: 10px;")
         restore_btn.clicked.connect(self.execute_revert)
         layout.addWidget(restore_btn)
+
+    def on_revert_cell_clicked(self, row, col):
+        if col == 0:
+            if item := self.table.item(row, 0):
+                item.setCheckState(Qt.Unchecked if item.checkState() == Qt.Checked else Qt.Checked)
 
     def set_all(self, checked):
         state = Qt.Checked if checked else Qt.Unchecked
@@ -675,8 +769,8 @@ class RevertDialog(QDialog):
 class EBIRManagerApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Xyk0Tech eBIRForms Data Manager")
-        self.resize(1150, 760)
+        self.setWindowTitle("Xyk0Tech eBIRForms Data Manager v3.1")
+        self.resize(1180, 780)
         self.source_records = {}       
         self.dest_records = {}         
         self.init_ui()
@@ -725,7 +819,7 @@ class EBIRManagerApp(QMainWindow):
         self.scan_btn.clicked.connect(self.scan_records)
         ctrl_bar.addWidget(self.scan_btn)
 
-        ctrl_bar.addSpacing(20)
+        ctrl_bar.addSpacing(15)
         ctrl_bar.addWidget(QLabel("Search/Filter:"))
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Filter by Taxpayer Name or TIN...")
@@ -736,15 +830,29 @@ class EBIRManagerApp(QMainWindow):
             btn = QPushButton(text)
             btn.clicked.connect(lambda checked, s=state: self.set_all_checkboxes(s))
             ctrl_bar.addWidget(btn)
+
+        self.copy_top_btn = QPushButton("📋 Copy to Excel")
+        self.copy_top_btn.setStyleSheet("background-color: #00695C; color: white; font-weight: bold; padding: 6px 12px;")
+        self.copy_top_btn.clicked.connect(self.copy_records_to_clipboard)
+        ctrl_bar.addWidget(self.copy_top_btn)
+
         main_layout.addLayout(ctrl_bar)
 
         self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels([
             "Select", "Taxpayer / Company Name", "TIN", "Forms Count", "Last Updated", "Status / Backup Info"
         ])
+        # Remove focus rectangle beside checkboxes and size Select column snugly
+        self.table.setFocusPolicy(Qt.NoFocus)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
+        self.table.setColumnWidth(0, 55)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.cellClicked.connect(self.on_table_cell_clicked)
         main_layout.addWidget(self.table)
+
+        copy_shortcut = QShortcut(QKeySequence.Copy, self.table)
+        copy_shortcut.activated.connect(self.copy_records_to_clipboard)
 
         tin_box = QGroupBox("TIN Format Options (Updates BOTH Filenames and XML tags)")
         tin_layout = QHBoxLayout(tin_box)
@@ -789,18 +897,29 @@ class EBIRManagerApp(QMainWindow):
         self.import_btn.setStyleSheet("background-color: #6A1B9A; color: white; font-weight: bold; padding: 10px;")
         self.import_btn.clicked.connect(self.import_backup)
 
+        self.copy_main_btn = QPushButton("📋 Copy Table Records for Excel / Google Sheets (Ctrl+C)")
+        self.copy_main_btn.setStyleSheet("background-color: #00695C; color: white; font-weight: bold; padding: 10px;")
+        self.copy_main_btn.clicked.connect(self.copy_records_to_clipboard)
+
         action_layout.addWidget(self.upgrade_btn, 0, 0)
         action_layout.addWidget(self.transfer_btn, 0, 1)
         action_layout.addWidget(self.clone_btn, 0, 2)
         action_layout.addWidget(self.revert_btn, 1, 0)
         action_layout.addWidget(self.export_btn, 1, 1)
         action_layout.addWidget(self.import_btn, 1, 2)
+        action_layout.addWidget(self.copy_main_btn, 2, 0, 1, 3)
         main_layout.addLayout(action_layout)
 
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
-        self.log_view.setMaximumHeight(110)
+        self.log_view.setMaximumHeight(105)
         main_layout.addWidget(self.log_view)
+
+    def on_table_cell_clicked(self, row, col):
+        """Toggles the checkbox when clicking anywhere in the Select column cell."""
+        if col == 0:
+            if item := self.table.item(row, 0):
+                item.setCheckState(Qt.Unchecked if item.checkState() == Qt.Checked else Qt.Checked)
 
     def toggle_inplace_mode(self, checked):
         if checked:
@@ -838,6 +957,47 @@ class EBIRManagerApp(QMainWindow):
         self.log_view.verticalScrollBar().setValue(self.log_view.verticalScrollBar().maximum())
         QApplication.processEvents()
 
+    # --- COPY RECORDS FOR SPREADSHEET (EXCEL / GOOGLE SHEETS) ---
+    def copy_records_to_clipboard(self):
+        if self.table.rowCount() == 0:
+            return QMessageBox.information(self, "Empty Table", "There are no records on the dashboard to copy yet.")
+
+        headers = ["Taxpayer / Company Name", "TIN", "Forms Count", "Last Updated", "Status / Backup Info"]
+        rows_data = ["\t".join(headers)]
+
+        for r in range(self.table.rowCount()):
+            if self.table.isRowHidden(r):
+                continue
+            chk_item = self.table.item(r, 0)
+            if chk_item and chk_item.checkState() == Qt.Checked:
+                row_vals = [
+                    (self.table.item(r, c).text() if self.table.item(r, c) else "").replace("\t", " ").replace("\n", " ")
+                    for c in range(1, 6)
+                ]
+                rows_data.append("\t".join(row_vals))
+
+        if len(rows_data) == 1:
+            for r in range(self.table.rowCount()):
+                if self.table.isRowHidden(r):
+                    continue
+                row_vals = [
+                    (self.table.item(r, c).text() if self.table.item(r, c) else "").replace("\t", " ").replace("\n", " ")
+                    for c in range(1, 6)
+                ]
+                rows_data.append("\t".join(row_vals))
+
+        count = len(rows_data) - 1
+        if count == 0:
+            return QMessageBox.information(self, "No Visible Records", "No matching records are visible to copy.")
+
+        QApplication.clipboard().setText("\n".join(rows_data))
+        self.log(f"📋 Copied {count} record(s) to clipboard for spreadsheet pasting.")
+        QMessageBox.information(
+            self, "Copied to Clipboard",
+            f"Copied {count} record(s) with headers!\n\n"
+            f"Open Microsoft Excel or Google Sheets and press Ctrl + V to paste."
+        )
+
     def scan_records(self):
         src = self.src_input.text().strip()
         dest = self.dest_input.text().strip()
@@ -866,6 +1026,15 @@ class EBIRManagerApp(QMainWindow):
                     rel_dir = os.path.relpath(root_dir, folder)
                     if rel_dir == '.':
                         rel_dir = ""
+
+                    if is_malformed_clone_filename(file):
+                        try:
+                            os.remove(full_path)
+                            self.log(f"🧹 Cleaned up malformed clone file: {file}")
+                            continue
+                        except Exception:
+                            pass
+
                     try:
                         rec = parse_xml_record(full_path)
                         if rec and rec['base_tin']:
@@ -908,7 +1077,7 @@ class EBIRManagerApp(QMainWindow):
             r = self.table.rowCount()
             self.table.insertRow(r)
             chk = QTableWidgetItem()
-            chk.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+            chk.setFlags(Qt.ItemIsEnabled)
             chk.setCheckState(Qt.Checked)
             chk.setData(Qt.UserRole, base_tin)
             self.table.setItem(r, 0, chk)
@@ -956,8 +1125,9 @@ class EBIRManagerApp(QMainWindow):
 
     def set_all_checkboxes(self, c):
         for r in range(self.table.rowCount()):
-            if i := self.table.item(r, 0):
-                i.setCheckState(Qt.Checked if c else Qt.Unchecked)
+            if not self.table.isRowHidden(r):
+                if i := self.table.item(r, 0):
+                    i.setCheckState(Qt.Checked if c else Qt.Unchecked)
 
     def get_selected_tins(self):
         return [
